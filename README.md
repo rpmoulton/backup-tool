@@ -1,7 +1,13 @@
 # TypeScript CLI Backup Tool
 
- ⚠️ Note: This implementation is optimized for clarity and simplicity, not scalability. It is best suited for demos, small workloads, or experimentation. 
+ ⚠️ Note: This implementation is optimized only for clarity and simplicity, not scalability. It is best suited for demos, small workloads, or experimentation. 
  (To scale we'd need to introduce a db for the snapshots, and an external filesystem such as S3 or similar)
+
+ It is also not optimized for performance.
+ - There are some redundant file reads
+ - Directory traversal is not optimized
+ - Synchronous I/O is used
+ - Inefficient snapshot / memory usage
 
 ### Prerequisites
 
