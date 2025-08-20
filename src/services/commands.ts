@@ -19,6 +19,10 @@ export default class CommandService {
         try {
             const snapshots = this.fileService.listSnapshots();
             console.log("Snapshots:");
+            if (snapshots.length === 0) {
+                console.log("No snapshots found.");
+                return;
+            }
             snapshots.forEach((snap: any) => {
                 console.log(`ID: ${snap.id}, TIMESTAMP: ${snap.date}, SIZE: ${this.fileService.logicalSize(snap.id)} KB, DISTINCT: ${this.fileService.physicalSize(snap.id)} KB`);
             });
