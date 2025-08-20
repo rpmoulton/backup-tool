@@ -1,5 +1,8 @@
 # TypeScript CLI Backup Tool
 
+ ⚠️ Note: This implementation is optimized for clarity and simplicity, not scalability. It is best suited for demos, small workloads, or experimentation. 
+ (To scale we'd need to introduce a db for the snapshots, and an external filesystem such as S3 or similar)
+
 ### Prerequisites
 
 - Node.js (version 12 or higher)
@@ -54,19 +57,7 @@ node dist/index.js restore 3
 Takes a snapshot of all files in the specified directory and stores their
 content and filenames in a "database". (the filesystem .mydb)
 
-- Only the file contents and filenames are stored as part of the snapshot;
-  metadata like permissions, ownership, or timestamps are ignored.
-- Snapshots store only incremental differences in order to minimize the
-  size of the database. That is, the minimal amount of data necessary to
-  express the new state of the directory by referencing already-stored data.
-- The tool does not store any duplicate file or directory content. It uses
-  content hashes (such as SHA-256) to detect changes and avoid storing
-  duplicate content.
-- The database is the filesystem -- it utilizes a .mydb folder to store blobs and snapshots
-- Snapshots are given a number in sequence based on the order in which they
-  were created.
-
-Illustrative example:
+ Example:
 
     $ node dist/index.js snapshot ~/my_important_files
 
@@ -74,10 +65,7 @@ Illustrative example:
 
 Lists snapshots that are stored in the database.
 
-- Snapshots are listed in a table on console.log with the following columns:
-  snapshot number, timestamp, size (logical), distinct (physical)
-
-Illustrative example:
+ Example:
 
     $ node dist/index.js list
     Snapshots:
@@ -88,14 +76,7 @@ Illustrative example:
 
 Restores the directory state from any previous snapshot into a new directory.
 
-- The recreates the entire directory structure and contents exactly
-  as they were at the time of the snapshot.
-- Only the files present in the snapshot are restored.
-- All files that were originally shapshotted are restored.
-- The restored files are bit-for-bit identical to the originally
-  snapshotted files.
-
-Illustrative example:
+ Example:
 
     $ node dist/index.js restore 42 ./out
 
@@ -103,11 +84,7 @@ Illustrative example:
 
 Removes old snapshots from the database and deletes any unreferenced data.
 
-- The tool allows the user to prune older snapshots while ensuring no
-  data loss from the remaining snapshots.
-- After pruning, all remaining snapshots are still fully restorable.
-
-Illustrative example:
+ Example:
 
     $ node dist/index.js prune 42
 

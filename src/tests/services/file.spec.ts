@@ -4,7 +4,7 @@ import FileService from "../../services/file";
 import { Flat, Snapshot } from "../../types";
 
 const TMP_DIR: string = "tmp_test";
-const DB_DIR: string = ".mydb";
+const DB_DIR: string = ".tmp_test_db";
 
 const fileService = new FileService({
   DB_DIR
@@ -38,7 +38,7 @@ describe("FileService", () => {
 
     const flat: Flat = fileService.reconstructSnapshot(snap1.id);
     expect(Object.keys(flat).sort()).toEqual(["a.txt", "b.txt"]);
-    expect(fileService.loadContent(flat["a.txt"])).toBe("hello");
+    expect(fileService.loadContent(flat["a.txt"]).toString()).toBe("hello");
   });
 
   it("detects modifications to a file", () => {
@@ -49,7 +49,7 @@ describe("FileService", () => {
     const snap2: Snapshot = fileService.createSnapshot(TMP_DIR);
 
     const flat2: Flat = fileService.reconstructSnapshot(snap2.id);
-    expect(fileService.loadContent(flat2["a.txt"])).toBe("HELLO");
+    expect(fileService.loadContent(flat2["a.txt"]).toString()).toBe("HELLO");
 
     // Ensure different hash from snap1
     expect(flat2["a.txt"]).not.toBe(fileService.reconstructSnapshot(snap1.id)["a.txt"]);
