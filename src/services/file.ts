@@ -160,7 +160,7 @@ export default class FileService {
 
     pruneSnapshot(id: number): void {
         const snapshot: Snapshot = this.loadSnapshot(id);
-        if (!snapshot) {
+        if (snapshot.date === "") {
             throw new Error(`Snapshot with ID ${id} does not exist.`);
         }
 
