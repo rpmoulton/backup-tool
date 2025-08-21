@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto, { BinaryLike } from "crypto";
-import { Flat, Snapshot, SnapshotChanges } from "../types";
+import { Flat, Snapshot, SnapshotChanges, FileWithContent } from "../types";
 
 //default directory if not passed in at construction
 const DB_DIR = ".mydb";
@@ -10,6 +10,10 @@ export default class FileService {
     private DB_DIR: string;
     private BLOBS_DIR: string;
     private SNAP_DIR: string;
+    private snapshotCache: Map<number, Snapshot> = new Map();
+    private flatCache: Map<number, Flat> = new Map();
+    private blobPresenceCache: Map<string, boolean> = new Map();
+    private blobSizeCache = new Map<string, number>();
 
     constructor(options?: { DB_DIR?: string }) {
         this.DB_DIR = DB_DIR;
@@ -30,31 +34,58 @@ export default class FileService {
         const subdir: string = path.join(this.BLOBS_DIR, hash.slice(0, 2));
         const filePath: string = path.join(subdir, hash.slice(2));
 
-        if (!fs.existsSync(filePath)) {
-            fs.mkdirSync(subdir, { recursive: true });
-            fs.writeFileSync(filePath, content);
+        try {
+            // Try to create the directory if it doesn't exist
+            if (!fs.existsSync(subdir)) {
+                fs.mkdirSync(subdir, { recursive: true });
+            }
+            // Use 'wx' flag to write only if file doesn't exist
+            fs.writeFileSync(filePath, content, { flag: 'wx' });
+        } catch (error: unknown) {
+            // Type guard to check if the error has a code property
+            if (error && typeof error === 'object' && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+                // Ignore EEXIST error (file already exists)
+                return hash;
+            }
+            // Re-throw other errors
+            throw error;
         }
         return hash;
     }
 
-    loadContent(hash: string): Uint8Array {
+    async loadContent(hash: string): Promise<Buffer> {
         const subdir: string = path.join(this.BLOBS_DIR, hash.slice(0, 2));
         const filePath: string = path.join(subdir, hash.slice(2));
-        return fs.readFileSync(filePath) as unknown as Uint8Array;
+        return fs.promises.readFile(filePath);
     }
 
-    flattenDir(dirPath: string, prefix: string = ""): Flat {
-        let flat: Flat = {};
-        for (const entry of fs.readdirSync(dirPath)) {
+    private flattenDirWithContent(dirPath: string, prefix: string = ""): [Flat, FileWithContent[]] {
+        const flat: Flat = {};
+        const filesWithContent: FileWithContent[] = [];
+        const entries = fs.readdirSync(dirPath);
+        
+        for (const entry of entries) {
             const fullPath: string = path.join(dirPath, entry);
             const relPath: string = prefix ? `${prefix}/${entry}` : entry;
             const stat: fs.Stats = fs.statSync(fullPath);
+            
             if (stat.isDirectory()) {
-                flat = { ...flat, ...this.flattenDir(fullPath, relPath) };
+                const [subFlat, subFiles] = this.flattenDirWithContent(fullPath, relPath);
+                Object.assign(flat, subFlat);
+                filesWithContent.push(...subFiles);
             } else {
-                flat[relPath] = this.hashContent(fs.readFileSync(fullPath) as unknown as BinaryLike);
+                const content = fs.readFileSync(fullPath);
+                const hash = this.hashContent(content as unknown as BinaryLike);
+                flat[relPath] = hash;
+                filesWithContent.push({ path: relPath, content, hash });
             }
         }
+        
+        return [flat, filesWithContent];
+    }
+    
+    flattenDir(dirPath: string, prefix: string = ""): Flat {
+        const [flat] = this.flattenDirWithContent(dirPath, prefix);
         return flat;
     }
 
@@ -64,7 +95,7 @@ export default class FileService {
         return Math.max(...files.map(f => parseInt(f)));
     }
 
-    loadSnapshot(id: number): Snapshot {
+    async loadSnapshot(id: number): Promise<Snapshot> {
         //handles an edge case where the snapshot file does not exist (manual deletion)
         if (fs.existsSync(path.join(this.SNAP_DIR, `${id}.json`)) === false) {
             return { id, date: "", parent: null, changes: { added: {}, modified: {}, deleted: [] } };
@@ -72,173 +103,291 @@ export default class FileService {
 
         //reg case
         const filePath: string = path.join(this.SNAP_DIR, `${id}.json`);
-        return JSON.parse(fs.readFileSync(filePath, "utf8"));
+        return JSON.parse(await fs.promises.readFile(filePath, "utf8"));
     }
 
-    saveSnapshot(snapshot: Snapshot): void {
+    async saveSnapshot(snapshot: Snapshot): Promise<void> {
         const filePath: string = path.join(this.SNAP_DIR, `${snapshot.id}.json`);
-        fs.writeFileSync(filePath, JSON.stringify(snapshot, null, 2));
+        await fs.promises.writeFile(filePath, JSON.stringify(snapshot, null, 2));
     }
 
-    createSnapshot(dirPath: string): Snapshot {
-        const flat: Flat = this.flattenDir(dirPath);
+    async createSnapshot(dirPath: string): Promise<Snapshot> {
+        const [flat, filesWithContent] = this.flattenDirWithContent(dirPath);
         let parent: Snapshot | null = null;
         let parentFlat: Flat = {};
         const lastId: number | null = this.lastSnapshotId();
         if (lastId) {
-            parent = this.loadSnapshot(lastId);
-            parentFlat = this.reconstructSnapshot(parent.id);
+            parent = await this.loadSnapshot(lastId);
+            parentFlat = await this.reconstructSnapshot(parent.id);
         }
 
         const newId: number = lastId ? lastId + 1 : 1;
-        const snapshot: Snapshot = { id: newId, parent: parent?.id || null, date: new Date().toISOString(), changes: { added: {}, modified: {}, deleted: [''] } };
+        const snapshot: Snapshot = { id: newId, parent: parent?.id || null, date: new Date().toISOString(), changes: { added: {}, modified: {}, deleted: [] } };
         const changes: SnapshotChanges = { added: {}, modified: {}, deleted: [] };
-
-        // Track Added/modified
-        for (const [pathKey, content] of Object.entries(flat)) {
-            const hash: string = this.storeBlob(fs.readFileSync(path.join(dirPath, pathKey)) as unknown as BinaryLike);
-            if (!(pathKey in parentFlat)) {
-                changes.added[pathKey] = hash;
-            } else {
-                const oldHash: string = this.hashContent(parentFlat[pathKey]);
-                if (oldHash !== hash) {
+        
+        // Process added and modified files
+        await Promise.all(
+            filesWithContent.map(async ({ path: pathKey, content, hash }) => {
+                // Only store the blob if it doesn't already exist
+                const blobPath = this.blobPath(hash);
+                if (!fs.existsSync(blobPath)) {
+                    await this.storeBlob(content as unknown as BinaryLike);
+                }
+                
+                if (!(pathKey in parentFlat)) {
+                    changes.added[pathKey] = hash;
+                } else if (parentFlat[pathKey] !== hash) {
                     changes.modified[pathKey] = hash;
                 }
-            }
-        }
+            })
+        );
 
         // Track Deleted
-        for (const pathKey of Object.keys(parentFlat)) {
-            if (!(pathKey in flat)) {
-                changes.deleted.push(pathKey);
-            }
-        }
+        await Promise.all(
+            Object.keys(parentFlat).map(async (pathKey) => {
+                if (!(pathKey in flat)) {
+                    changes.deleted.push(pathKey);
+                }
+            })
+        );
         snapshot.changes = changes;
 
-        this.saveSnapshot(snapshot);
+        await this.saveSnapshot(snapshot);
 
         return snapshot;
     }
 
-    reconstructSnapshot(id: number): Flat {
-        const snap: Snapshot = this.loadSnapshot(id);
-        let flat: Flat = {};
-        if (snap.parent) {
-            flat = this.reconstructSnapshot(snap.parent);
+    private async loadSnapshotWithCache(id: number): Promise<Snapshot> {
+        if (this.snapshotCache.has(id)) {
+            return this.snapshotCache.get(id)!;
         }
-        for (const [key, hash] of Object.entries(snap.changes.added)) {
-            flat[key] = hash;
+        try {
+            const snapPath = path.join(this.SNAP_DIR, `${id}.json`);
+            const data = await fs.promises.readFile(snapPath, 'utf8');
+            const snapshot = JSON.parse(data);
+            this.snapshotCache.set(id, snapshot);
+            return snapshot;
+        } catch (error) {
+            throw new Error(`Failed to load snapshot ${id}: ${error}`);
         }
-        for (const [key, hash] of Object.entries(snap.changes.modified)) {
-            flat[key] = hash;
+    }
+
+    async reconstructSnapshot(id: number): Promise<Flat> {
+        if (this.flatCache.has(id)) {
+            return this.flatCache.get(id)!;
         }
-        for (const key of snap.changes.deleted) {
-            delete flat[key];
+        
+        const snapshotChain: Snapshot[] = [];
+        let currentId: number | null = id;
+        
+        // Build the snapshot chain
+        while (currentId !== null) {
+            const snap: Snapshot = await this.loadSnapshotWithCache(currentId);
+            snapshotChain.unshift(snap);
+            currentId = snap.parent;
+        }
+        
+        // Reconstruct the flat state by applying each snapshot in order
+        const flat: Flat = {};
+        for (const snap of snapshotChain) {
+            // Apply added and modified changes
+            for (const [key, hash] of Object.entries(snap.changes.added)) {
+                flat[key] = hash;
+            }
+            for (const [key, hash] of Object.entries(snap.changes.modified)) {
+                flat[key] = hash;
+            }
+            // Apply deletions
+            for (const key of snap.changes.deleted) {
+                delete flat[key];
+            }
+            // Cache the result for each snapshot in the chain
+            // Cache the result at each level
+            this.flatCache.set(snap.id, { ...flat });
         }
 
         return flat;
     }
 
-    restoreSnapshot(id: number, targetDir: string): void {
-        const flat: Flat = this.reconstructSnapshot(id);
+    async restoreSnapshot(id: number, targetDir: string): Promise<void> {
+        const flat: Flat = await this.reconstructSnapshot(id);
+        // Ensure target directory exists
+        if (!fs.existsSync(targetDir)) {
+            fs.mkdirSync(targetDir, { recursive: true });
+        }
+        
+        // Process each file in the snapshot
         for (const [relPath, hash] of Object.entries(flat)) {
-            const content: Uint8Array = this.loadContent(hash);
-            const outPath: string = path.join(targetDir, relPath);
-            fs.mkdirSync(path.dirname(outPath), { recursive: true });
-            fs.writeFileSync(outPath, content);
+            try {
+                const content: Buffer = await this.loadContent(hash);
+                const outPath: string = path.join(targetDir, relPath);
+                const dirPath = path.dirname(outPath);
+                
+                // Ensure the directory exists
+                if (!fs.existsSync(dirPath)) {
+                    fs.mkdirSync(dirPath, { recursive: true });
+                }
+
+                // Write the file
+                await fs.promises.writeFile(outPath, content as unknown as Uint8Array);
+            } catch (error) {
+                console.error(`Error restoring file ${relPath}:`, error);
+                throw error;
+            }
         }
     }
 
-    listSnapshots(): Snapshot[] {
+    async listSnapshots(): Promise<Snapshot[]> {
         const files: string[] = fs.readdirSync(this.SNAP_DIR);
-        return files.map(file => {
+        const snapshots: Snapshot[] = await Promise.all(files.map(async file => {
             const id = parseInt(path.basename(file, '.json'));
-            const snapshot = this.loadSnapshot(id);
+            const snapshot = await this.loadSnapshot(id);
             return { ...snapshot, id, };
-        }).sort((a, b) => a.id - b.id);
+        }));
+        return snapshots.sort((a, b) => a.id - b.id);
     }
 
-    pruneSnapshot(id: number): void {
-        const snapshot: Snapshot = this.loadSnapshot(id);
+    private async *getAllUsedBlobs(): AsyncIterableIterator<string> {
+        // Process snapshots one at a time to reduce memory usage
+        for (const file of fs.readdirSync(this.SNAP_DIR)) {
+            const id = parseInt(path.basename(file, '.json'));
+            if (isNaN(id)) continue;
+            
+            const snapshot = await this.loadSnapshot(id);
+            for (const hash of this.blobsInSnapshot(snapshot)) {
+                yield hash;
+            }
+        }
+    }
+
+    async pruneSnapshot(id: number): Promise<void> {
+        const snapshot: Snapshot = await this.loadSnapshot(id);
         if (snapshot.date === "") {
             throw new Error(`Snapshot with ID ${id} does not exist.`);
         }
 
-        //remap the next snapshot to point to the previous parent.
-        const nextSnapshot: Snapshot | null = this.loadSnapshot(id + 1);
+        // Remap the next snapshot to point to the previous parent
+        const nextSnapshot: Snapshot | null = await this.loadSnapshot(id + 1);
         if (nextSnapshot && nextSnapshot.parent === id) {
             nextSnapshot.parent = snapshot.parent;
-            this.saveSnapshot(nextSnapshot);  
+            this.saveSnapshot(nextSnapshot);
         }
 
         // Remove the snapshot file
         const filePath = path.join(this.SNAP_DIR, `${id}.json`);
         fs.unlinkSync(filePath);
 
-        // Get blobs still in use
-        const allSnapshots: Snapshot[] = this.listSnapshots();
-        const usedBlobs: Set<string> = new Set();
-        allSnapshots.forEach((snap: Snapshot) => {
-            this.blobsInSnapshot(snap).forEach((blobHash: string) => {
-                usedBlobs.add(blobHash)
-            });
-        });
+        // Process blobs in use using a Set for O(1) lookups
+        const usedBlobs = new Set<string>();
+        for await (const hash of this.getAllUsedBlobs()) {
+            usedBlobs.add(hash);
+        }
 
-        // Remove unused blobs
+        // Process blob directories
         for (const subdir of fs.readdirSync(this.BLOBS_DIR)) {
             const subdirPath = path.join(this.BLOBS_DIR, subdir);
-            if (!fs.lstatSync(subdirPath).isDirectory()) continue;
+            const stat = fs.lstatSync(subdirPath);
+            
+            if (!stat.isDirectory()) {
+                continue;
+            }
 
-            for (const file of fs.readdirSync(subdirPath)) {
-                const fullHash: string = subdir + file;
-                const filePath: string = path.join(subdirPath, file);
-
-                if (!usedBlobs.has(fullHash)) {
-                    fs.unlinkSync(filePath);
+            let isEmpty = true;
+            const entries = fs.readdirSync(subdirPath);
+            
+            // Process files in the subdirectory
+            for (const file of entries) {
+                const fullHash = subdir + file;
+                const filePath = path.join(subdirPath, file);
+                
+                try {
+                    if (!usedBlobs.has(fullHash)) {
+                        fs.unlinkSync(filePath);
+                    } else {
+                        // If we find at least one used file, the directory isn't empty
+                        isEmpty = false;
+                    }
+                } catch (error) {
+                    console.warn(`Failed to process blob ${filePath}:`, error);
                 }
             }
 
-            // clean up empty directories
-            if (fs.readdirSync(subdirPath).length === 0) {
-                fs.rmdirSync(subdirPath);
+            // Clean up empty directories
+            if (isEmpty) {
+                try {
+                    fs.rmdirSync(subdirPath);
+                } catch (error) {
+                    console.warn(`Failed to remove directory ${subdirPath}:`, error);
+                }
             }
         }
     }
 
-    directoryExists(directoryPath: string): boolean {
-        return fs.existsSync(directoryPath) && fs.lstatSync(directoryPath).isDirectory();
+    async directoryExists(directoryPath: string): Promise<boolean> {
+        try {
+            const stat = await fs.promises.stat(directoryPath);
+            return stat.isDirectory();
+        } catch (error) {
+            return false;
+        }
     }
 
-    ensureDirsExist(): void {
-        [this.DB_DIR, this.BLOBS_DIR, this.SNAP_DIR].forEach(d => {
-            if (!this.directoryExists(d)) fs.mkdirSync(d, { recursive: true });
-        });
-    }
-
-    dbSize(): number {
-        let total: number = 0;
-        const subdirs: string[] = fs.readdirSync(this.BLOBS_DIR);
-        for (const sub of subdirs) {
-            const files: string[] = fs.readdirSync(path.join(this.BLOBS_DIR, sub));
-            for (const file of files) {
-                const filePath = path.join(this.BLOBS_DIR, sub, file);
-                total += fs.statSync(filePath).size;
+    async ensureDirsExist(): Promise<void> {
+        const dirs = [this.DB_DIR, this.BLOBS_DIR, this.SNAP_DIR];
+        for (const dir of dirs) {
+            try {
+                await fs.promises.mkdir(dir, { recursive: true });
+            } catch (error:any) {
+                // Ignore error if directory already exists
+                if (error.code !== 'EEXIST') {
+                    throw error;
+                }
             }
         }
-        return total;
     }
 
-    logicalSize(snapshotId: number): number {
-        const flat: Flat = this.reconstructSnapshot(snapshotId);
+    async dbSize(): Promise<number> {
+        try {
+            const subdirs = await fs.promises.readdir(this.BLOBS_DIR);
+            let total = 0;
+            
+            for (const sub of subdirs) {
+                const files = await fs.promises.readdir(path.join(this.BLOBS_DIR, sub));
+                const sizes = await Promise.all(
+                    files.map(file => 
+                        fs.promises.stat(path.join(this.BLOBS_DIR, sub, file))
+                            .then(stat => stat.size)
+                            .catch(() => 0)
+                    )
+                );
+                total += sizes.reduce((sum, size) => sum + size, 0);
+            }
+            return total;
+        } catch (error) {
+            return 0;
+        }
+    }
+
+    async logicalSize(snapshotId: number): Promise<number> {
+        const flat: Flat = await this.reconstructSnapshot(snapshotId);
         let total: number = 0;
         for (const key of Object.values(flat)) {
-            total += this.blobSize(key);
+            total += await this.blobSize(key);
         }
         return total;
     }
 
-    blobSize(hash: string): number {
-        return fs.statSync(this.blobPath(hash)).size;
+    async blobSize(hash: string): Promise<number> {
+        if (this.blobSizeCache.has(hash)) {
+            return this.blobSizeCache.get(hash)!;
+        }
+        try {
+            const size = (await fs.promises.stat(this.blobPath(hash))).size;
+            this.blobSizeCache.set(hash, size);
+            return size;
+        } catch (error) {
+            return 0; // Return 0 for missing blobs
+        }
     }
 
     blobPath(hash: string): string {
@@ -252,26 +401,76 @@ export default class FileService {
         ];
     }
 
-    seenBefore(hash: string, snapshot: Snapshot): boolean {
+    
+    async seenBefore(hash: string, snapshot: Snapshot): Promise<boolean> {
+        const cacheKey = `${hash}-${snapshot.id}`;
+        
+        // Check cache first
+        if (this.blobPresenceCache.has(cacheKey)) {
+            return this.blobPresenceCache.get(cacheKey)!;
+        }
+        
+        // Check current snapshot first (most likely to have recent changes)
+        if (this.blobsInSnapshot(snapshot).includes(hash)) {
+            this.blobPresenceCache.set(cacheKey, true);
+            return true;
+        }
+        
+        // Then check parent chain
         let current: number | null = snapshot.parent;
         while (current) {
-            const parent: Snapshot = this.loadSnapshot(current);
-            if (this.blobsInSnapshot(parent).includes(hash)) {
+            const parent = await this.loadSnapshotWithCache(current);
+            const parentBlobs = this.blobsInSnapshot(parent);
+            
+            // Cache results for parent snapshots as we go
+            const parentCacheKey = `${hash}-${parent.id}`;
+            const isPresent = parentBlobs.includes(hash);
+            this.blobPresenceCache.set(parentCacheKey, isPresent);
+            
+            if (isPresent) {
+                this.blobPresenceCache.set(cacheKey, true);
                 return true;
             }
+            
             current = parent.parent;
         }
+        
+        this.blobPresenceCache.set(cacheKey, false);
         return false;
     }
     
-    physicalSize(snapshotId: number): number {
-        const snap: Snapshot = this.loadSnapshot(snapshotId);
-        let total: number = 0;
-        for (const hash of this.blobsInSnapshot(snap)) {
-            if (!this.seenBefore(hash, snap)) {
-                total += this.blobSize(hash);
+    async physicalSize(snapshotId: number): Promise<number> {
+        try {
+            const snap = await this.loadSnapshot(snapshotId);
+            const blobs = this.blobsInSnapshot(snap);
+            let totalSize = 0;
+            
+            // For each blob in this snapshot, check if it's referenced by any parent snapshots
+            for (const hash of blobs) {
+                let isUnique = true;
+                let currentSnap = snap;
+                
+                // Check parent snapshots for this blob
+                while (currentSnap.parent !== null) {
+                    const parent = await this.loadSnapshot(currentSnap.parent);
+                    const parentBlobs = this.blobsInSnapshot(parent);
+                    
+                    if (parentBlobs.includes(hash)) {
+                        isUnique = false;
+                        break;
+                    }
+                    currentSnap = parent;
+                }
+                
+                if (isUnique) {
+                    totalSize += await this.blobSize(hash);
+                }
             }
+            
+            return totalSize;
+        } catch (error) {
+            console.error(`Error calculating physical size for snapshot ${snapshotId}:`, error);
+            return 0;
         }
-        return total;
     }
 }

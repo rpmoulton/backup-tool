@@ -6,18 +6,18 @@ export default class CommandService {
         this.fileService = new FileService();
     }
 
-    handleSnapshot(target: string): void {
+    async handleSnapshot(target: string): Promise<void> {
         try {
-            this.fileService.createSnapshot(target);
+            await this.fileService.createSnapshot(target);
             console.log(`Snapshot created for target: ${target}`);
         } catch (error: any) {
             console.error(`Error creating snapshot: ${error.message}`);
         }
     }
 
-    handleList(): void {
+    async handleList(): Promise<void> {
         try {
-            const snapshots = this.fileService.listSnapshots();
+            const snapshots = await this.fileService.listSnapshots();
             console.log("Snapshots:");
             if (snapshots.length === 0) {
                 console.log("No snapshots found.");
@@ -32,18 +32,18 @@ export default class CommandService {
         }
     }
 
-    handleRestore(id: string, target: string): void {
+    async handleRestore(id: string, target: string): Promise<void> {
         try {
-            this.fileService.restoreSnapshot(parseInt(id), target);
+            await this.fileService.restoreSnapshot(parseInt(id), target);
             console.log(`Snapshot ${id} restored to target: ${target}`)
         } catch (error: any) {
             console.error(`Error restoring snapshot: ${error.message}`);
         }
     }
 
-    handlePrune(id: string): void {
+    async handlePrune(id: string): Promise<void> {
         try {
-            this.fileService.pruneSnapshot(parseInt(id));
+            await this.fileService.pruneSnapshot(parseInt(id));
             console.log(`Snapshot ${id} pruned successfully.`)
         } catch (error: any) {
             console.error(`Error pruning snapshot: ${error.message}`);
