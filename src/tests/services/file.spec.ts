@@ -16,6 +16,14 @@ function writeFile(relPath:string, content:string) {
 }
 
 beforeEach(async () => {
+  // Clean up any existing test directories
+  fs.rmSync(TMP_DIR, { recursive: true, force: true });
+  fs.rmSync(DB_DIR, { recursive: true, force: true });
+  fs.rmSync('restored', { recursive: true, force: true });
+
+  // Create fresh test directories
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+  
   fileService = new FileService({
     DB_DIR
   });

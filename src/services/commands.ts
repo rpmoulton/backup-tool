@@ -23,10 +23,10 @@ export default class CommandService {
                 console.log("No snapshots found.");
                 return;
             }
-            snapshots.forEach((snap: any) => {
-                console.log(`ID: ${snap.id}, TIMESTAMP: ${snap.date}, SIZE: ${this.fileService.logicalSize(snap.id)} KB, DISTINCT: ${this.fileService.physicalSize(snap.id)} KB`);
+            snapshots.forEach(async (snap: any) => {
+                console.log(`ID: ${snap.id}, TIMESTAMP: ${snap.date}, SIZE: ${await this.fileService.logicalSize(snap.id)} KB, DISTINCT: ${await this.fileService.physicalSize(snap.id)} KB`);
             });
-            console.log(`Total size: ${this.fileService.dbSize()} KB`);
+            console.log(`Total size: ${await this.fileService.dbSize()} KB`);
         } catch (error: any) {
             console.error(`Error pruning snapshot: ${error.message}`);
         }
